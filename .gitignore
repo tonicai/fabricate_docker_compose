@@ -1,0 +1,18 @@
+# IDEs
+.vscode/
+.idea/
+.cursor/
+.claude/
+
+# OS files
+.DS_Store
+
+# Environment & secrets
+.env
+.env.*
+
+# Misc editor / backup files
+*~
+\#*\#
+.\#*
+.history

@@ -1,0 +1,113 @@
+networks:
+  fabricate_internal: # Internal network for communication with Database and Redis.
+    driver: bridge
+
+volumes:
+  fabricate_data: # Volume where Fabricate stores generated datasets.
+  fabricate_sockets: # Volume where Fabricate shares sockets for communication with PDF sidecar.
+  fabricate_local_storage: # Volume where Fabricate stores files if no other cloud storage (S3) is configured.
+  postgres_data: # Volume where PostgreSQL stores database data.
+
+services:
+  db:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      # Pass only the database credentials from .env to the database container.
+      # The database is created only once when the container is started for the first time. After that, the changes from .env are not applied.
+      POSTGRES_USER: ${FABRICATE_DATABASE_USERNAME}
+      POSTGRES_PASSWORD: ${FABRICATE_DATABASE_PASSWORD}
+      POSTGRES_DB: ${FABRICATE_DATABASE_NAME}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - fabricate_internal
+
+  redis:
+    image: 'redis:7.4.8'
+    restart: unless-stopped
+    environment:
+      # Pass only the Redis password from .env to the Redis container.
+      REDIS_PASSWORD: ${FABRICATE_REDIS_PASSWORD}
+    command: ["sh", "-c", "exec redis-server --requirepass \"$$REDIS_PASSWORD\""]
+    networks:
+      - fabricate_internal
+
+  # pdf-sidecar: PDF generation sidecar
+  pdf-sidecar:
+    image: 'quay.io/tonicai/fabricate-html-to-pdf-sidecar:latest'
+    restart: unless-stopped
+    # Security: no network access. Docker provides the isolation boundary.
+    network_mode: none
+    cap_drop:
+      - ALL
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 1024m
+    environment:
+      # PDF sidecar shouldn't have access to all other environment variables from the .env. Pass only the PDF socket path.
+      FABRICATE_PDF_SOCKET_PATH: ${FABRICATE_PDF_SOCKET_PATH}
+    volumes:
+      # Chrome and Puppeteer need writable /tmp for browser profile temp dirs.
+      # The named volume on /fabricate/sockets is separate from this tmpfs.
+      - type: tmpfs
+        target: /tmp
+        tmpfs:
+          size: 536870912  # 512 MB
+      - type: tmpfs
+        target: /dev/shm
+        tmpfs:
+          size: 268435456  # 256 MB
+      - fabricate_sockets:/fabricate/sockets
+
+  # web: Application container with REST API and web console
+  web:
+    image: 'quay.io/tonicai/fabricate:latest'
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_started
+      redis:
+        condition: service_started
+      pdf-sidecar:
+        condition: service_healthy
+    ports:
+      - '3000:3000'
+    env_file:
+      # Pass all environment variables from the .env file to the web container.
+      - .env
+    cap_add:
+      - SYS_PTRACE
+    volumes:
+      - fabricate_data:/fabricate/data
+      - fabricate_sockets:/fabricate/sockets
+      - fabricate_local_storage:/fabricate/storage
+    networks:
+      - fabricate_internal
+  
+  # worker: Background jobs processor
+  worker:
+    image: 'quay.io/tonicai/fabricate:latest'
+    restart: unless-stopped
+    command: ["bundle", "exec", "sidekiq", "-e", "production"]
+    depends_on:
+      db:
+        condition: service_started
+      redis:
+        condition: service_started
+      pdf-sidecar:
+        condition: service_healthy
+      web:
+        condition: service_started
+    env_file:
+      # Pass all environment variables from the .env file to the worker container.
+      - .env
+    cap_add:
+      - SYS_PTRACE
+    volumes:
+      - fabricate_data:/fabricate/data
+      - fabricate_sockets:/fabricate/sockets
+      - fabricate_local_storage:/fabricate/storage
+    networks:
+      - fabricate_internal
